@@ -194,6 +194,32 @@ internal static class FeedGate
         // (task #18) is live and self-inflicted garbage on the render thread is exactly what
         // it is trying to account for.
         Feeds.ForEachSlot(_pollOne);
+
+        // MASTER DORMANCY (task #40): recompute the any-feed-live flag once per frame and
+        // announce the edges. The consumers gate themselves on Feeds.AnyLive; nothing here
+        // reaches into them, so a consumer that is mid-operation finishes its step and
+        // simply declines the next one — the same graceful-cut contract the per-feed gate
+        // already honours.
+        bool wasLive = Feeds.AnyLive;
+        Feeds.RecomputeAnyLive();
+        if (wasLive != Feeds.AnyLive)
+        {
+            RttLog.Global(Feeds.AnyLive
+                ? "MASTER GATE: a feed went live — world-side systems (clipmap camera/budget, " +
+                  "flora override, viewer distance, presence/preload) re-arm on their next pass."
+                : "MASTER GATE: no feed is live — world-side systems stand down and scoped " +
+                  "engine globals restore. The mod should now cost ~nothing per frame.");
+
+            // The viewer-distance delegate is the switch on a ~107k calls/s path, and the
+            // config poll only re-evaluates it when the FILE changes — so gate edges must
+            // drive it here or a dormant mod keeps paying the dispatch forever.
+            try
+            {
+                ViewerDistance.SetHook((FeedConfig.ViewerDistanceOverride || FeedConfig.FixLodCycling)
+                                       && Feeds.AnyLive);
+            }
+            catch (Exception e) { RttLog.Error("master gate viewer hook", e); }
+        }
     }
 
     private static readonly Action _pollOne = () => PollFeed(Clock.Ms);

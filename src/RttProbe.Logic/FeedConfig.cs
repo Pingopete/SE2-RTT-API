@@ -1797,7 +1797,10 @@ internal static class FeedConfig
             // entity in the scene — ~107,000 calls a second still paying a delegate dispatch
             // and a contended counter increment to reach a method that does nothing. Only
             // removing the hook lets the postfix early-out. Idempotent, so it is safe here.
-            ViewerDistance.SetHook(ViewerDistanceOverride || FixLodCycling);
+            // MASTER GATE (task #40): the delegate IS the switch on a ~107k calls/s path —
+            // with no feed live it comes out entirely, and the next poll after a feed
+            // re-arms puts it back (SetHook is idempotent).
+            ViewerDistance.SetHook((ViewerDistanceOverride || FixLodCycling) && Feeds.AnyLive);
             if (viewerWas != ViewerDistanceOverride)
                 RttLog.Global($"Config: viewerDistance {viewerWas} -> {ViewerDistanceOverride}" +
                     (ViewerDistanceOverride

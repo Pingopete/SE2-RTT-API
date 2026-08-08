@@ -1338,7 +1338,9 @@ internal static class WorldGrids
         // exists to make the SERVER generate sectors around the camera, which is the fragile
         // path. Reads as "knob off" until the world settles, so the existing teardown branch
         // below removes any marker that somehow survived a load.
-        var want = FeedConfig.ServerPresenceEntity && CameraFeed.ResidencySettled;
+        // MASTER GATE (task #40): a dead feed must not keep a presence entity generating
+        // sectors around its camera — the existing teardown branch below removes it.
+        var want = FeedConfig.ServerPresenceEntity && CameraFeed.ResidencySettled && Feeds.AnyLive;
         if (!want && _serverMarker == null
             && !FeedConfig.CameraTriggerEntity && _marker == null
             && !_serverFloraSurveyPending) return;
@@ -2436,6 +2438,13 @@ internal static class WorldGrids
             if (_marker != null) DestroyCameraTriggerEntity("cameraTriggerEntity was set to 0");
             return;
         }
+        // MASTER GATE (task #40): same shape as the knob-off branch — no live feed, no
+        // materialization bubble riding a dead camera.
+        if (!Feeds.AnyLive)
+        {
+            if (_marker != null) DestroyCameraTriggerEntity("no feed is live — master gate");
+            return;
+        }
 
         try
         {
@@ -2872,6 +2881,10 @@ internal static class WorldGrids
 
     internal static object ChooseClipmapCamera(object renderComponent, object boxedTransform)
     {
+        // MASTER GATE (task #40): with no feed live, every body follows the engine's own
+        // camera choice — the redirection that kept 11 bodies LODing around a DEAD feed's
+        // camera (observed in the 21:16 dormant log) stops here.
+        if (!Feeds.AnyLive) return null;
         if (!FeedConfig.PerBodyClipmapCamera || boxedTransform == null) return null;
         _clipmapCalls++;
         if (!EnsureClipmapReflection(renderComponent, boxedTransform)) return null;
@@ -3042,11 +3055,31 @@ internal static class WorldGrids
     // the engine's value alone, and that stays the default.
     private static double _budgetApplied;
     private static object _budgetProp;
+    private static object _budgetOriginal;   // the engine's own UpdateTimeout, saved at first apply
 
     private static void ApplyClipmapBudget()
     {
-        var want = FeedConfig.ClipmapUpdateBudgetMs;
-        if (want <= 0 || Math.Abs(want - _budgetApplied) < 0.01) return;
+        // MASTER GATE (task #40): the widened budget is a GLOBAL that spends the player's
+        // frame for feed terrain detail — with no feed live it must give the engine its own
+        // value back, not sit at our number forever (it did, and the 21:16 dormant log paid
+        // for it). Restore-on-dormant, re-apply on the next live pass.
+        var want = Feeds.AnyLive ? FeedConfig.ClipmapUpdateBudgetMs : 0;
+        if (want <= 0)
+        {
+            if (_budgetApplied > 0 && _budgetProp is System.Reflection.PropertyInfo pr && _lodOwner != null && _budgetOriginal != null)
+            {
+                try
+                {
+                    pr.SetValue(_lodOwner, _budgetOriginal);
+                    RttLog.Line($"CLIPMAP BUDGET restored to the engine's own {_budgetOriginal} " +
+                                (Feeds.AnyLive ? "(knob cleared)." : "(no feed live — master gate)."));
+                }
+                catch (Exception e) { RttLog.Error("clipmap budget restore", e); }
+                _budgetApplied = 0;
+            }
+            return;
+        }
+        if (Math.Abs(want - _budgetApplied) < 0.01) return;
         try
         {
             _lodOwner ??= Type.GetType("RttProbe.RttBridge, RttProbe")
@@ -3055,13 +3088,15 @@ internal static class WorldGrids
             var p = _lodOwner.GetType().GetProperty("UpdateTimeout", Any);
             if (p == null || !p.CanWrite) return;
             var was = p.GetValue(_lodOwner);
+            _budgetOriginal ??= was;
             p.SetValue(_lodOwner, TimeSpan.FromMilliseconds(want));
             _budgetApplied = want; _budgetProp = p;
             RttLog.Line($"CLIPMAP BUDGET: UpdateTimeout {was} -> {want} ms. The engine ships 0.5 ms " +
                         "for ALL clipmap updates per frame, and UpdateClipmaps bails on IsTimingOut — " +
                         "so a second viewer's body competes for that same half-millisecond. This is " +
                         "GLOBAL: it buys terrain detail everywhere and spends the player's frame time " +
-                        "to do it. Watch the player's fps, not just the feed's.");
+                        "to do it. Watch the player's fps, not just the feed's. Restored automatically " +
+                        "while no feed is live (master gate).");
         }
         catch (Exception e) { RttLog.Error("clipmap budget", e); _budgetApplied = want; }
     }
@@ -4223,6 +4258,9 @@ internal static class WorldGrids
     // alternate between viewers every frame and the octree never settled.
     internal static bool OnFloraSectorUpdate(object component, object[] args, bool visibilityJob)
     {
+        // MASTER GATE (task #40): no live feed, no flora-sector camera claims — the
+        // ~6.5k/s of claim work observed while dormant stops at one field read.
+        if (!Feeds.AnyLive) return false;
         if (!FeedConfig.FloraCameraOverride || component == null || args == null || args.Length < 2) return false;
         _floraCalls++;
 

@@ -741,6 +741,24 @@ internal static class Feeds
         return false;
     }
 
+    // THE MASTER DORMANCY FLAG (task #40, the zero-dormant-overhead mandate). True while
+    // ANY feed's gate is active; read by every world-side system and hot hook that must
+    // stop costing anything when no panel displays a feed: the clipmap camera redirection
+    // and budget, the flora-camera override, the nearest-viewer distance delegate, the
+    // presence/trigger/preload residency work. A volatile recomputed once per PollAll —
+    // hot paths pay one field read, transitions land within a poll period. Distinct from
+    // FeedGate.Paused (the whole-mod file lever) and from per-feed GateActive: this is
+    // "is there any consumer at all".
+    internal static volatile bool AnyLive;
+
+    internal static void RecomputeAnyLive()
+    {
+        bool any = false;
+        for (int i = 0; i < MaxFeeds; i++)
+            if (All[i].GateActive) { any = true; break; }
+        AnyLive = any;
+    }
+
     // Scan forward from the rotation origin for the first feed that can actually use the
     // slot. Pure: same answer for the prefix, the camera pass and the postfix of one frame,
     // which is the invariant those three hooks rely on. If nobody is eligible the origin is
