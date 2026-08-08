@@ -145,6 +145,33 @@ shadows = more caster geometry per cascade, denser atmosphere). RULE: fps compar
 are valid only within one session's sun-window; cross-boot A/Bs must use the stage
 table's CPU numbers, or the test save needs a pinned time of day.
 
+## Day 2: the true baseline hunt (2026-08-08)
+
+The launch args carry TWO plugins: `D:\SE2LcdCursor\LcdCursorApi.dll` AND RttProbe.
+DISABLED.marker fully inerts RttProbe only (constructor-return before any patch/thread —
+verified in code, zero RttProbe lines in the game log), so the morning "no-mod" boot was
+really GAME + CURSOR API: engine-authoritative 57.6-57.9 Hz (the game's own *_Stats.log
+`Render Frequency`, which REWRITES in place ~every few min — the trusted instrument; the
+NVIDIA overlay read ~4 fps low and is ruled out per the user). The Steam-bounce trick
+did NOT strip the args this time (documented behavior failed to reproduce — Steam
+relaunched WITH plugins); the user removed the -plugins launch options in Steam instead.
+
+**THE VERDICT (pure boot, args line empty, same midday window)**:
+    game PURE:            57.50 Hz   (GPU 17.49 ms, VRAM 12.06 GiB)
+    game + cursor API:    57.59-57.85 Hz
+The pure game runs ~57.5 in this scene TODAY — the remembered ~70 did not reproduce.
+Cursor API: no measurable cost. RttProbe-inert (marker): no cost, as designed. The
+morning's inferred "~4.2 ms / 16 fps dormant hole" is RESOLVED as a cross-sun comparison
+artifact — yesterday's 53.9 dormant tier was measured under a different sun than any
+70-class reference. What stands: the FEED costs ~10-12 fps when active (internal
+same-window ladder), and the precise mod-dormant-vs-pure delta needs one same-window
+A-B (expected small). The zero-dormant-overhead mandate (#40) remains the design goal;
+the emergency is off.
+
+TO RESTORE THE MOD: re-add to Steam launch options:
+    -plugins:D:\SE2LcdCursor\LcdCursorApi.dll;D:\SE2Rtt\RttProbe.dll
+and delete D:\SE2Rtt\DISABLED.marker when RttProbe should arm.
+
 ## Where this leaves the 60 fps goal (rewritten 2026-08-08 after the baseline correction)
 
 frame = scene's true ~14.3 ms (no mod, ~70 fps user-reported)
