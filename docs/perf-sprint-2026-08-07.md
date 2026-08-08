@@ -172,6 +172,36 @@ TO RESTORE THE MOD: re-add to Steam launch options:
     -plugins:D:\SE2LcdCursor\LcdCursorApi.dll;D:\SE2Rtt\RttProbe.dll
 and delete D:\SE2Rtt\DISABLED.marker when RttProbe should arm.
 
+## The activation-window CTD, third instance (2026-08-08 15:00)
+
+User powered the LCD panels ~20 s after world-up; the gate went ACTIVE at 14:59:59.239
+and 79 ms later the render thread hit the KNOWN prioritizer assert (`index >= 0 &&
+index < _count`, FastBuffer, ManagedTexturePrioritizerComponent.CollectStandards) with
+a 4.9 s sim stall IN PROGRESS at that moment. Our nested render had not run even once
+(the 2000 ms hold was still counting), so the master-gate build is exonerated as
+mechanism. ATTRIBUTION CORRECTED: the 2026-08-07 conclusion blamed feedTextureCamera as
+"the only live input of ours in that component" — this crash fired with that knob OFF,
+so the racy input is the ACTIVATION BURST itself (panel material rebind + buffer builds
+churning collections the prioritizer walks) inside the post-load fragile window, not
+any single knob. Mitigation: activationGraceMs 4000 -> 15000 (the 4 s grace cleared
+the window it was sized for, not the post-load hitch storm). The durable fix remains
+making activation not mutate render-side collections mid-walk — #41/#56's cycle-safe
+arming neighborhood.
+
+## THE MASTER GATE ACCEPTANCE TEST — PASSED (2026-08-08 15:11)
+
+Same midday window, engine/cadence counters, user-focused game:
+
+    game PURE (zero plugins):                57.5 fps
+    MOD LOADED, feed dormant, master gate:   58.2 fps   <- AT the pure baseline
+    feed ACTIVE:                             44.2 fps   (submit 2.44 ms, best yet)
+
+The stand-down sequence fired within 12 ms of the dormant flip: gate DORMANT ->
+"MASTER GATE: no feed is live" -> camera trigger destroyed -> presence removed ->
+viewer delegate out -> clipmap budget restored. The mod's dormant cost is ZERO within
+noise — the zero-dormant-overhead mandate is met, measured. The whole mod now costs
+exactly its active feed (~14 fps in this scene) and nothing else.
+
 ## Where this leaves the 60 fps goal (rewritten 2026-08-08 after the baseline correction)
 
 frame = scene's true ~14.3 ms (no mod, ~70 fps user-reported)
