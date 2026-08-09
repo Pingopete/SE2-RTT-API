@@ -4621,22 +4621,46 @@ internal static class WholeSceneRender
     private static long _apertureLastMs, _apertureLogMs;
     private static double _apertureLoggedEv = double.NaN;
 
+    // Day factor from the sun's elevation: 0 = night, 1 = day, smoothstepped across the
+    // twilight band (feedExposureDawnDot..feedExposureDayDot). The one sun signal, shared
+    // by auto-aperture and the ambient floor's night dimming (#60). False = no planet up
+    // or no sun found (deep space) — callers keep their day behaviour.
+    //
+    // RATE-LIMITED to 1/s: TrySunFromPlanetEnv re-scans the planet-env setup reflectively
+    // on every call ("the sun moves"), which is fine at aperture cadence but not at
+    // per-render cadence — and the sun moves over minutes, not frames.
+    private static long _dayFactorMs;
+    private static double _dayFactorVal = 1;
+    private static bool _dayFactorOk;
+
+    private static bool TryDayFactor(out double t)
+    {
+        var now = Clock.Ms;
+        if (now - _dayFactorMs >= 1000)
+        {
+            _dayFactorMs = now;
+            _dayFactorOk = false;
+            var up = CameraFeed.PlanetUpCache;
+            if (up.LengthSquared() >= 0.5 && TrySunDirection(out var sun))
+            {
+                double dot = (sun.X * up.X + sun.Y * up.Y + sun.Z * up.Z) * FeedConfig.FeedSunSign;
+                double lo = FeedConfig.FeedExposureDawnDot, hi = FeedConfig.FeedExposureDayDot;
+                double v = hi - lo < 1e-6 ? (dot >= hi ? 1 : 0) : (dot - lo) / (hi - lo);
+                v = v < 0 ? 0 : v > 1 ? 1 : v;
+                _dayFactorVal = v * v * (3 - 2 * v);
+                _dayFactorOk = true;
+            }
+        }
+        t = _dayFactorVal;
+        return _dayFactorOk;
+    }
+
     private static bool TryAutoExposureEv(out double ev)
     {
         ev = 0;
-        // Local up: the same planet-radial vector the orbit is built on. In space there is
-        // no meaningful "sun elevation" and no up, so auto aperture simply does not engage.
-        var up = CameraFeed.PlanetUpCache;
-        if (up.LengthSquared() < 0.5) return false;
-        if (!TrySunDirection(out var sun)) return false;
-
-        double dot = (sun.X * up.X + sun.Y * up.Y + sun.Z * up.Z) * FeedConfig.FeedSunSign;
-
-        // Smoothstep across the twilight band so dawn is a glide, not a step.
-        double lo = FeedConfig.FeedExposureDawnDot, hi = FeedConfig.FeedExposureDayDot;
-        double t = hi - lo < 1e-6 ? (dot >= hi ? 1 : 0) : (dot - lo) / (hi - lo);
-        t = t < 0 ? 0 : t > 1 ? 1 : t;
-        t = t * t * (3 - 2 * t);
+        // In space there is no meaningful sun elevation and no up, so auto aperture
+        // simply does not engage. Same gate as the floor dimming — one signal, TryDayFactor.
+        if (!TryDayFactor(out double t)) return false;
         double target = FeedConfig.FeedExposureNight
                       + (FeedConfig.FeedExposureDay - FeedConfig.FeedExposureNight) * t;
 
@@ -4653,7 +4677,7 @@ internal static class WholeSceneRender
         if (now - _apertureLogMs > 5000 && Math.Abs(_apertureEv - _apertureLoggedEv) > 0.05)
         {
             _apertureLogMs = now; _apertureLoggedEv = _apertureEv;
-            RttLog.Line($"Auto aperture: sun·up={dot:F3} -> target {target:+0.00;-0.00} EV, " +
+            RttLog.Line($"Auto aperture: dayFactor={t:F3} -> target {target:+0.00;-0.00} EV, " +
                         $"now at {_apertureEv:+0.00;-0.00} EV (night {FeedConfig.FeedExposureNight:+0.##;-0.##}, " +
                         $"day {FeedConfig.FeedExposureDay:+0.##;-0.##}, tau {tau:F1}s). If this reads bright at " +
                         "midnight the sun vector points the other way — flip feedSunSign.");
@@ -6552,7 +6576,7 @@ internal static class WholeSceneRender
     // says so once, rather than throwing on a hot path.
     private static FieldInfo _fNestedRtOff, _fAmbientFloor, _fFloorState;
     private static PropertyInfo _piLastAmbient;
-    private static bool _nestedRtOffTried, _nestedRtOffMissingLogged, _floorStateLogged, _llaModeLogged;
+    private static bool _nestedRtOffTried, _nestedRtOffMissingLogged, _floorStateLogged, _llaModeLogged, _nightDimLogged;
     private static bool SetNestedRtOff(bool value)
     {
         if (!FeedConfig.WholeSceneIblOnlyAmbient) return false;
@@ -6609,6 +6633,25 @@ internal static class WholeSceneRender
                                         "engine's own curve. feedAmbientFloor is the TRIM (daylight brightness); " +
                                         "night dims with the sun by construction.");
                         }
+                    }
+                }
+
+                // #60 NIGHT DIMMING: scale the floor by the sun's elevation — the same
+                // signal auto-aperture uses (planet-env light direction · planet-radial up,
+                // twilight-smoothstepped). In open wilderness LLA is 0 and the branch above
+                // leaves the CONSTANT floor, which is why night read as bright as day. A
+                // multiplicative factor keeps both paths monotone; the floor value pushed
+                // is per-pass BUFFER CONTENT, so the snapshot law is untouched.
+                if (FeedConfig.FeedAmbientFloorNightMult >= 0 && TryDayFactor(out double dayT))
+                {
+                    floor *= (float)(FeedConfig.FeedAmbientFloorNightMult
+                                     + (1.0 - FeedConfig.FeedAmbientFloorNightMult) * dayT);
+                    if (!_nightDimLogged)
+                    {
+                        _nightDimLogged = true;
+                        RttLog.Line($"AMBIENT FLOOR: night dimming armed — dayFactor={dayT:F3}, floor " +
+                                    $"scaled to {floor:F4} (night keeps {FeedConfig.FeedAmbientFloorNightMult:P0} " +
+                                    "of the day floor; feedAmbientFloorNightMult tunes it, -1 disarms).");
                     }
                 }
                 _fAmbientFloor.SetValue(null, floor);

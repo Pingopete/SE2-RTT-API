@@ -181,6 +181,12 @@ internal static class FeedConfig
     // Live-tunable. 0 = black shadows.
     public static double FeedAmbientFloor { get; private set; } = 0.02;
 
+    // #60: how much of the day floor survives at NIGHT (0.15 = 15%). The floor is scaled
+    // by the sun-elevation day factor (planet-env light direction · planet-radial up,
+    // twilight-smoothstepped, the same signal auto-aperture uses). -1 disarms the dimming
+    // entirely (constant floor, the pre-#60 behaviour). Live.
+    public static double FeedAmbientFloorNightMult { get; private set; } = 0.15;
+
     // Localise SCREEN-SPACE REFLECTIONS to the feed camera.
     //
     // Clears SSSRSettings.EnableTemporalAccumulation for our pass only, which gates the whole
@@ -2179,6 +2185,7 @@ internal static class FeedConfig
             WholeSceneIrCachePopulate   = Bool(kv, "wholeSceneIrCachePopulate", WholeSceneIrCachePopulate);
             WholeSceneIblOnlyAmbient    = Bool(kv, "wholeSceneIblOnlyAmbient", WholeSceneIblOnlyAmbient);
             FeedAmbientFloor            = Dbl(kv, "feedAmbientFloor", FeedAmbientFloor);
+            FeedAmbientFloorNightMult   = Dbl(kv, "feedAmbientFloorNightMult", FeedAmbientFloorNightMult);
             PanelCoverFit               = Bool(kv, "panelCoverFit", PanelCoverFit);
             WholeSceneDisableEyeAdaptation = Bool(kv, "wholeSceneDisableEyeAdaptation", WholeSceneDisableEyeAdaptation);
 
