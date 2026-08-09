@@ -43,8 +43,15 @@ internal static class GpuReportProbe
     private static readonly object _lock = new();
     private static readonly Dictionary<string, (double ms, int n)> _tagTotals = new();
     private static int _frames, _handlerErrs;
-    private static long _lastDumpMs;
+    private static long _lastDumpMs, _armedAtMs;
     private static bool _discardLogged, _shapeLogged;
+
+    // The confession counters (first deploy printed NOTHING when reports were empty —
+    // silence indistinguishable from a dead handler, the exact instrument sin this
+    // repo keeps re-paying for). Every 15s window now reports which link is dead.
+    private static long _handlerFires, _reportsSeen;
+    private static bool _fallbackSubscribed;
+    private static Delegate _fallbackHandler;
 
     // Called from the per-frame pump (cheap once installed). Lazy, failure-tolerant,
     // and silent after a terminal failure.
@@ -120,8 +127,10 @@ internal static class GpuReportProbe
             }
             _fiBridgeHook.SetValue(null, (Action)OnWatchesReady);
             _subscribed = true;
+            _armedAtMs = Clock.Ms;
             RttLog.Line("GPU REPORT PROBE: armed via the bootstrap forwarder — first windows dump the " +
-                        "raw tag shape; clustering into player-pass vs feed-pass comes once the shape is seen.");
+                        "raw tag shape; clustering into player-pass vs feed-pass comes once the shape is seen. " +
+                        DescribeEngineSubscription());
         }
         catch (Exception e)
         {
@@ -131,11 +140,64 @@ internal static class GpuReportProbe
     }
 
     // Render-thread handler: aggregate only, never log here, never throw.
+    // Is the BOOTSTRAP's forwarder actually on the engine event? The event is field-like
+    // (`field Action OnWatchesReady`), so its backing delegate is readable and the
+    // invocation list names its subscribers' declaring types. This is what separates
+    // "bootstrap never subscribed" from "subscribed but the event never fires".
+    private static string DescribeEngineSubscription()
+    {
+        try
+        {
+            var fi = _profiler.GetType().GetField("OnWatchesReady", Any);
+            if (fi == null) return "(engine event backing field unreadable)";
+            if (fi.GetValue(_profiler) is not Delegate d) return "ENGINE EVENT HAS NO SUBSCRIBERS — the bootstrap forwarder did NOT subscribe.";
+            var subs = d.GetInvocationList();
+            bool boot = false;
+            foreach (var s in subs) if (s.Method?.DeclaringType?.Name == "RttPlugin") { boot = true; break; }
+            return $"Engine event subscribers: {subs.Length}, bootstrap forwarder {(boot ? "PRESENT" : "ABSENT")}.";
+        }
+        catch (Exception e) { return "(subscription introspection failed: " + e.Message + ")"; }
+    }
+
+    // FALLBACK: if 30s pass with the bridge armed and the handler never firing while the
+    // bootstrap forwarder is absent, subscribe DIRECTLY from the logic. The hot-reload
+    // hazard (a delegate outliving this collectible assembly) is accepted and mitigated:
+    // Reset() removes it before every reload, and it is loudly logged as the fallback
+    // path so a future reload-crash has its suspect named in advance.
+    private static void MaybeFallbackSubscribe()
+    {
+        if (_fallbackSubscribed || _handlerFires > 0) return;
+        if (Clock.Ms - _armedAtMs < 30000) return;
+        try
+        {
+            var desc = DescribeEngineSubscription();
+            if (desc.Contains("PRESENT"))
+            {
+                RttLog.Line("GPU REPORT PROBE: forwarder PRESENT but the event never fires — the engine is not " +
+                            "raising OnWatchesReady in this configuration. " + desc);
+                _fallbackSubscribed = true;   // nothing further to try; stop re-checking
+                return;
+            }
+            var evt = _profiler.GetType().GetEvent("OnWatchesReady", Any);
+            if (evt == null) { _fallbackSubscribed = true; return; }
+            _fallbackHandler = Delegate.CreateDelegate(evt.EventHandlerType!, typeof(GpuReportProbe)
+                .GetMethod(nameof(OnWatchesReady), BindingFlags.Static | BindingFlags.NonPublic)!);
+            evt.AddEventHandler(_profiler, _fallbackHandler);
+            _fallbackSubscribed = true;
+            RttLog.Line("GPU REPORT PROBE: FALLBACK — subscribed directly from the logic assembly (" + desc +
+                        "). Reset() removes this before every reload; if a reload ever crashes in the render " +
+                        "thread after this line, this subscription is the first suspect.");
+        }
+        catch (Exception e) { _fallbackSubscribed = true; RttLog.Error("gpu probe fallback subscribe", e); }
+    }
+
     private static void OnWatchesReady()
     {
         try
         {
+            System.Threading.Interlocked.Increment(ref _handlerFires);
             if (_fiReports?.GetValue(_profiler) is not IList reports || reports.Count == 0) return;
+            System.Threading.Interlocked.Add(ref _reportsSeen, reports.Count);
             lock (_lock)
             {
                 _frames++;
@@ -155,6 +217,8 @@ internal static class GpuReportProbe
 
     private static void MaybeDump()
     {
+        MaybeFallbackSubscribe();
+
         var now = Clock.Ms;
         if (now - _lastDumpMs < 15000) return;
         _lastDumpMs = now;
@@ -163,7 +227,18 @@ internal static class GpuReportProbe
         int frames;
         lock (_lock)
         {
-            if (_tagTotals.Count == 0) return;
+            if (_tagTotals.Count == 0)
+            {
+                // CONFESS which link is dead instead of the silence the first deploy shipped:
+                // handler never fired = no subscription or event never raised; fired with zero
+                // reports = the report list is empty/cleared before we read it.
+                RttLog.Line($"GPU REPORT PROBE heartbeat: handler fired {_handlerFires}x, reports seen " +
+                            $"{_reportsSeen}, no tags this window. " +
+                            (_handlerFires == 0 ? DescribeEngineSubscription()
+                                                : "The event fires but _tmpReports is empty at our read point — " +
+                                                  "the reports live elsewhere or are cleared first."));
+                return;
+            }
             rows = new KeyValuePair<string, (double, int)>[_tagTotals.Count];
             int i = 0;
             foreach (var kv in _tagTotals) rows[i++] = new(kv.Key, kv.Value);
@@ -200,10 +275,18 @@ internal static class GpuReportProbe
 
     // Hot-reload hygiene: clear the bridge delegate so it cannot point into a dead
     // assembly; the next install re-sets it. The bootstrap's engine subscription persists
-    // harmlessly (its handler null-checks the bridge field).
+    // harmlessly (its handler null-checks the bridge field). The FALLBACK subscription is
+    // the one that must not outlive us — removed here, before every reload.
     internal static void Reset()
     {
         try { _fiBridgeHook?.SetValue(null, null); } catch { }
+        try
+        {
+            if (_fallbackHandler != null && _profiler != null)
+                _profiler.GetType().GetEvent("OnWatchesReady", Any)?.RemoveEventHandler(_profiler, _fallbackHandler);
+        }
+        catch { }
+        _fallbackHandler = null; _fallbackSubscribed = false;
         _subscribed = false; _tried = false; _dead = false;
     }
 }
