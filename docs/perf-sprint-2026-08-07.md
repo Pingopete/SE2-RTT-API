@@ -202,6 +202,31 @@ viewer delegate out -> clipmap budget restored. The mod's dormant cost is ZERO w
 noise — the zero-dormant-overhead mandate is met, measured. The whole mod now costs
 exactly its active feed (~14 fps in this scene) and nothing else.
 
+## THE GPU TABLE IS LIVE (task #65, 2026-08-08 evening)
+
+Route: the engine's own GPUProfiler (CopyCommandList.BeginBlock -> AddQuery, depth-1
+blocks only). The shipping build clears its report lists BEFORE raising OnWatchesReady
+and dead-codes the per-tag storage — so a bootstrap postfix on ComputeFrameWorkTimeS
+snapshots the depth-0 reports at the one live seam, and the logic aggregates per tag
+(GPU BLOCKS line every 15s). Confession heartbeat + subscription introspection built in
+after v1 shipped silent-on-empty (the recurring instrument sin).
+
+First A-B (active window vs master-gate dormant window, adjacent, fresh-boot streaming
+noise ±0.5ms):
+
+    tag                          player-only   both     FEED'S SHARE
+    ScenePreparation + Render        4.78      7.74       ~2.9 ms   <- THE COST
+    DeferredLighting                 8.11      8.53       ~0.4 ms
+    ForwardAndPostPasses             4.57      4.27       ~0 (noise)
+    RtPrep+SceneFinalize             0.67      0.57       ~0
+    AccelerationStructures           0.35      x1.0 only  0 (build-once visible in GPU!)
+
+The x2.0/frame counts on the big three confirm the two-cluster model; dormant runs
+x1.0 at 53.3 fps (the master gate visible in GPU data). VERDICT: the feed's GPU is
+the GEOMETRY pass (draw-call volume), not lighting (our 1024 lighting is ~5% of the
+player's 4K cost), not post — consistent with the resolution null. Next lever: draw
+count in the nested pass (culling aggressiveness, instancing), verified per-tag.
+
 ## Where this leaves the 60 fps goal (rewritten 2026-08-08 after the baseline correction)
 
 frame = scene's true ~14.3 ms (no mod, ~70 fps user-reported)
