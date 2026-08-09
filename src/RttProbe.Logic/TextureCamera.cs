@@ -353,6 +353,19 @@ internal static class TextureCamera
             return;
         }
 
+        // THE LOAD-TIME GATE (2026-08-08, the promised cycle-safety for boot-with-1).
+        // Both prioritizer-assert CTDs in this family fired inside the post-load fragile
+        // window. The texture camera's vote is worthless during a loading screen anyway,
+        // so it now serves the same settle the residency systems serve: stand down until
+        // the world has been up — and un-stalled — for residencySettleMs. Mid-play engage
+        // is untouched (the settle is long past), and the lease semantics mean this needs
+        // no extra teardown path.
+        if (!CameraFeed.ResidencySettled)
+        {
+            Stand_Down();
+            return;
+        }
+
         var player = PlayerCameraWorld();
         if (player == null)
         {
@@ -376,11 +389,20 @@ internal static class TextureCamera
         var floor = SaturationFloor();
         var eye = feedEye;
         var backoff = FeedConfig.FeedTextureCameraBackoff;
-        if (backoff > 0)
+        // BOTH SIGNS (2026-08-08). The old `> 0` guard silently no-opped NEGATIVE values —
+        // including the user's "known-good" -500, which had therefore never applied at all.
+        // Positive = pull the virtual eye BACK along centre->eye (coarser/cheaper distant
+        // tiers); negative = push it TOWARD the scene (sharper distant foliage textures),
+        // clamped so it can never cross within 10 m of the centre and flip the ray.
+        if (Math.Abs(backoff) > 0.01)
         {
             var away = feedEye - orbitCentre;
             var len = away.Length();
-            if (len > 0.001) eye = feedEye + (away / len) * backoff;
+            if (len > 0.001)
+            {
+                var applied = Math.Max(backoff, -(len - 10.0));
+                eye = feedEye + (away / len) * applied;
+            }
         }
 
         var d = eye - player.Value;

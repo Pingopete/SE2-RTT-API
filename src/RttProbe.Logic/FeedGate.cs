@@ -198,6 +198,10 @@ internal static class FeedGate
         // GPU report probe (task #65): lazy arm + 15s dump check, one branch when idle.
         GpuReportProbe.Poll();
 
+        // Impostor probe (the missing-mid-band investigation): 15s state readout,
+        // change-triggered logging.
+        ImpostorProbe.Poll();
+
         // MASTER DORMANCY (task #40): recompute the any-feed-live flag once per frame and
         // announce the edges. The consumers gate themselves on Feeds.AnyLive; nothing here
         // reaches into them, so a consumer that is mid-operation finishes its step and
