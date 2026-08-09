@@ -280,6 +280,15 @@ public static class RttBridge
     // reaches a stage the settings do not gate.
     public static volatile Func<int, bool> SkipStageHook;
 
+    // ---- GPU PROFILER FORWARDER (task #65) --------------------------------------------
+    //
+    // The engine's GPUProfiler raises OnWatchesReady when a frame's GPU timestamp reports
+    // have resolved. The LOGIC side wants that signal, but a logic delegate subscribed
+    // directly to an engine event outlives its collectible assembly across hot reloads —
+    // so the BOOTSTRAP owns the one subscription and forwards through this field, which
+    // each logic install overwrites. Same pattern as every other hook on this bridge.
+    public static volatile Action GpuWatchesReadyHook;
+
     // ---- PER-STAGE TIMING (perf sprint 2026-08-07, task #63) --------------------------
     //
     // Wall ticks and run counts per skippable-stage id, accumulated ONLY while the logic
@@ -3437,8 +3446,39 @@ public sealed class RttPlugin : IPlugin
         {
             try { ReloadLogicIfChanged(); }
             catch (Exception e) { Log("ERROR worker: " + e.Message); }
+            try { EnsureGpuProfilerSubscription(); }
+            catch (Exception e) { if (_gpuSubErrs++ < 2) Log("ERROR gpu profiler subscribe: " + e.Message); }
             Thread.Sleep(2000);
         }
+    }
+
+    // ---- GPU PROFILER SUBSCRIPTION (task #65) -----------------------------------------
+    // CoreSystems.GPUProfiler is populated during render init, after this plugin's ctor,
+    // so the worker retries until it appears. The handler is a bootstrap static (this
+    // assembly never unloads); the logic side receives the signal via the bridge field.
+    private static bool _gpuSubscribed;
+    private static int _gpuSubErrs;
+
+    private static void EnsureGpuProfilerSubscription()
+    {
+        if (_gpuSubscribed) return;
+        var core = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+        var prof = core?.GetField("GPUProfiler",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null);
+        if (prof == null) return;    // render not initialized yet; retry next tick
+        var evt = prof.GetType().GetEvent("OnWatchesReady",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        if (evt == null) { _gpuSubscribed = true; Log("GPUProfiler.OnWatchesReady not found — no GPU forwarder."); return; }
+        var handler = Delegate.CreateDelegate(evt.EventHandlerType, typeof(RttPlugin)
+            .GetMethod(nameof(OnGpuWatchesReady), BindingFlags.Static | BindingFlags.NonPublic));
+        evt.AddEventHandler(prof, handler);
+        _gpuSubscribed = true;
+        Log("GPU profiler forwarder subscribed (OnWatchesReady -> RttBridge.GpuWatchesReadyHook).");
+    }
+
+    private static void OnGpuWatchesReady()
+    {
+        try { RttBridge.GpuWatchesReadyHook?.Invoke(); } catch { }
     }
 
     private void ReloadLogicIfChanged()

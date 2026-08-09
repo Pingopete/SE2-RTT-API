@@ -52,6 +52,7 @@ public static class LogicEntry
                 CameraCbSwap.Reset();
                 FeedHandover.Reset();
                 PanelBinding.Reset();
+                GpuReportProbe.Reset();   // clears the bridge delegate before this assembly is replaced
             }
 
             var bridge = Type.GetType("RttProbe.RttBridge, RttProbe");
