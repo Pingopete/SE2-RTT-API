@@ -289,6 +289,21 @@ public static class RttBridge
     // each logic install overwrites. Same pattern as every other hook on this bridge.
     public static volatile Action GpuWatchesReadyHook;
 
+    // ---- GPU REPORT SNAPSHOT (task #65 v3) --------------------------------------------
+    //
+    // OnFrameEndDisposal CLEARS _tmpReports/_tmpReports2 immediately BEFORE raising
+    // OnWatchesReady (IL-verified), and the per-tag CustomStorage writes are compiled out
+    // of the shipping build — so at event time the per-tag data is already gone. The one
+    // live seam: ComputeFrameWorkTimeS(List<Report>) runs on the DEPTH-0 report list just
+    // before the clears. A postfix there copies each top-level block's Tag/Duration/
+    // BeginTimeS into these arrays, GpuReportCount written LAST (the read gate). Single
+    // writer (render thread), read by the logic at the event that fires microseconds
+    // later in the same method — the snapshot is that same frame's by construction.
+    public static readonly string[] GpuReportTags = new string[64];
+    public static readonly double[] GpuReportMs = new double[64];
+    public static readonly double[] GpuReportBegin = new double[64];
+    public static volatile int GpuReportCount;
+
     // ---- PER-STAGE TIMING (perf sprint 2026-08-07, task #63) --------------------------
     //
     // Wall ticks and run counts per skippable-stage id, accumulated ONLY while the logic
@@ -2738,6 +2753,7 @@ public sealed class RttPlugin : IPlugin
         PatchSkippableStages(harmony, sds);
         PatchFsrGate(harmony);
         PatchExposureGate(harmony);
+        PatchGpuReports(harmony);   // task #65 — unconditional, per the gated-registration lesson
     }
 
     // __0 is the ResizableRWRenderTargetTexture the engine just rendered the player's
@@ -3479,6 +3495,56 @@ public sealed class RttPlugin : IPlugin
     private static void OnGpuWatchesReady()
     {
         try { RttBridge.GpuWatchesReadyHook?.Invoke(); } catch { }
+    }
+
+    // ---- GPU REPORT CAPTURE (task #65 v3) ---------------------------------------------
+    // Postfix on GPUProfiler.ComputeFrameWorkTimeS — the last point the depth-0 report
+    // list exists before OnFrameEndDisposal clears it. ~2-10 reports/frame, three
+    // reflected field reads each: an instrument-grade cost, not a hot-path one.
+    private static FieldInfo _fiGpuRepTag, _fiGpuRepDur, _fiGpuRepBegin;
+
+    private static void GpuReportsPostfix(object __0)
+    {
+        try
+        {
+            if (__0 is not System.Collections.IList list) { RttBridge.GpuReportCount = 0; return; }
+            int n = Math.Min(list.Count, RttBridge.GpuReportTags.Length);
+            int w = 0;
+            for (int i = 0; i < n; i++)
+            {
+                var r = list[i];
+                if (r == null) continue;
+                if (_fiGpuRepTag == null)
+                {
+                    var t = r.GetType();
+                    const BindingFlags F = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+                    _fiGpuRepTag = t.GetField("Tag", F);
+                    _fiGpuRepDur = t.GetField("Duration", F);
+                    _fiGpuRepBegin = t.GetField("BeginTimeS", F);
+                }
+                RttBridge.GpuReportTags[w] = _fiGpuRepTag?.GetValue(r) as string ?? "?";
+                RttBridge.GpuReportMs[w] = _fiGpuRepDur?.GetValue(r) is TimeSpan ts ? ts.TotalMilliseconds : 0;
+                RttBridge.GpuReportBegin[w] = _fiGpuRepBegin?.GetValue(r) is double d ? d : 0;
+                w++;
+            }
+            RttBridge.GpuReportCount = w;
+        }
+        catch { }
+    }
+
+    private static void PatchGpuReports(HarmonyLib.Harmony harmony)
+    {
+        try
+        {
+            var t = Type.GetType("Keen.VRage.Render12.Core.Profiling.GPUProfiler, VRage.Render12");
+            var mi = t?.GetMethod("ComputeFrameWorkTimeS",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (mi == null) { Log("GPU reports: ComputeFrameWorkTimeS not found — no per-tag GPU capture."); return; }
+            harmony.Patch(mi, postfix: new HarmonyLib.HarmonyMethod(typeof(RttPlugin)
+                .GetMethod(nameof(GpuReportsPostfix), BindingFlags.Static | BindingFlags.NonPublic)));
+            Log("GPU reports: ComputeFrameWorkTimeS postfix installed — depth-0 GPU blocks snapshot to the bridge.");
+        }
+        catch (Exception e) { Log("GPU reports patch FAILED: " + e.Message); }
     }
 
     private void ReloadLogicIfChanged()

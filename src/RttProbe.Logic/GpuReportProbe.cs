@@ -191,24 +191,42 @@ internal static class GpuReportProbe
         catch (Exception e) { _fallbackSubscribed = true; RttLog.Error("gpu probe fallback subscribe", e); }
     }
 
+    // Bridge snapshot fields (v3): the bootstrap's ComputeFrameWorkTimeS postfix copies
+    // each frame's depth-0 GPU blocks here BEFORE the engine clears its lists — the event
+    // fires microseconds later in the same method, so the snapshot is this frame's.
+    private static FieldInfo _fiSnapTags, _fiSnapMs, _fiSnapBegin, _fiSnapCount;
+    private static bool _snapResolved;
+
     private static void OnWatchesReady()
     {
         try
         {
             System.Threading.Interlocked.Increment(ref _handlerFires);
-            if (_fiReports?.GetValue(_profiler) is not IList reports || reports.Count == 0) return;
-            System.Threading.Interlocked.Add(ref _reportsSeen, reports.Count);
+
+            if (!_snapResolved)
+            {
+                _snapResolved = true;
+                var bridge = Type.GetType("RttProbe.RttBridge, RttProbe");
+                _fiSnapTags  = bridge?.GetField("GpuReportTags", Any);
+                _fiSnapMs    = bridge?.GetField("GpuReportMs", Any);
+                _fiSnapBegin = bridge?.GetField("GpuReportBegin", Any);
+                _fiSnapCount = bridge?.GetField("GpuReportCount", Any);
+            }
+            if (_fiSnapCount == null) return;   // old bootstrap; heartbeat says so
+
+            int count = (int)_fiSnapCount.GetValue(null)!;
+            if (count <= 0) return;
+            var tags = (string[])_fiSnapTags!.GetValue(null)!;
+            var ms   = (double[])_fiSnapMs!.GetValue(null)!;
+            System.Threading.Interlocked.Add(ref _reportsSeen, count);
             lock (_lock)
             {
                 _frames++;
-                for (int i = 0; i < reports.Count; i++)
+                for (int i = 0; i < count && i < tags.Length; i++)
                 {
-                    var r = reports[i];
-                    if (r == null) continue;
-                    string tag = _fiTag?.GetValue(r) as string ?? "?";
-                    double ms = _fiDuration?.GetValue(r) is TimeSpan ts ? ts.TotalMilliseconds : 0;
+                    string tag = tags[i] ?? "?";
                     _tagTotals.TryGetValue(tag, out var cur);
-                    _tagTotals[tag] = (cur.ms + ms, cur.n + 1);
+                    _tagTotals[tag] = (cur.ms + ms[i], cur.n + 1);
                 }
             }
         }
@@ -235,8 +253,11 @@ internal static class GpuReportProbe
                 RttLog.Line($"GPU REPORT PROBE heartbeat: handler fired {_handlerFires}x, reports seen " +
                             $"{_reportsSeen}, no tags this window. " +
                             (_handlerFires == 0 ? DescribeEngineSubscription()
-                                                : "The event fires but _tmpReports is empty at our read point — " +
-                                                  "the reports live elsewhere or are cleared first."));
+                                                : _fiSnapCount == null
+                                                    ? "Bridge snapshot fields absent — the bootstrap predates the " +
+                                                      "ComputeFrameWorkTimeS postfix; restart to adopt it."
+                                                    : "The event fires but GpuReportCount stays 0 — the postfix is " +
+                                                      "not filling the bridge (check the boot log for the patch line)."));
                 return;
             }
             rows = new KeyValuePair<string, (double, int)>[_tagTotals.Count];
